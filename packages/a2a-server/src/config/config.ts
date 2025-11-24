@@ -20,16 +20,16 @@ import {
   GEMINI_CONFIG_DIR,
   DEFAULT_GEMINI_EMBEDDING_MODEL,
   DEFAULT_GEMINI_MODEL,
+  type GeminiCLIExtension,
 } from '@google/gemini-cli-core';
 
 import { logger } from '../utils/logger.js';
 import type { Settings } from './settings.js';
-import type { Extension } from './extension.js';
 import { type AgentSettings, CoderAgentEvent } from '../types.js';
 
 export async function loadConfig(
   settings: Settings,
-  extensions: Extension[],
+  extensions: GeminiCLIExtension[],
   taskId: string,
 ): Promise<Config> {
   const mcpServers = mergeMcpServers(settings, extensions);
@@ -69,6 +69,7 @@ export async function loadConfig(
         settings.fileFiltering?.enableRecursiveFileSearch,
     },
     ideMode: false,
+    folderTrust: settings.folderTrust === true,
   };
 
   const fileService = new FileDiscoveryService(workspaceDir);
@@ -79,7 +80,7 @@ export async function loadConfig(
     false,
     fileService,
     extensionContextFilePaths,
-    true, /// TODO: Wire up folder trust logic here.
+    settings.folderTrust === true,
   );
   configParams.userMemory = memoryContent;
   configParams.geminiMdFileCount = fileCount;
@@ -108,28 +109,30 @@ export async function loadConfig(
     logger.info('[Config] Using Gemini API Key');
     await config.refreshAuth(AuthType.USE_GEMINI);
   } else {
-    logger.error(
-      `[Config] Unable to set GeneratorConfig. Please provide a GEMINI_API_KEY or set USE_CCPA.`,
-    );
+    const errorMessage =
+      '[Config] Unable to set GeneratorConfig. Please provide a GEMINI_API_KEY or set USE_CCPA.';
+    logger.error(errorMessage);
+    throw new Error(errorMessage);
   }
 
   return config;
 }
 
-export function mergeMcpServers(settings: Settings, extensions: Extension[]) {
+export function mergeMcpServers(
+  settings: Settings,
+  extensions: GeminiCLIExtension[],
+) {
   const mcpServers = { ...(settings.mcpServers || {}) };
   for (const extension of extensions) {
-    Object.entries(extension.config.mcpServers || {}).forEach(
-      ([key, server]) => {
-        if (mcpServers[key]) {
-          console.warn(
-            `Skipping extension MCP config for server with key "${key}" as it already exists.`,
-          );
-          return;
-        }
-        mcpServers[key] = server;
-      },
-    );
+    Object.entries(extension.mcpServers || {}).forEach(([key, server]) => {
+      if (mcpServers[key]) {
+        console.warn(
+          `Skipping extension MCP config for server with key "${key}" as it already exists.`,
+        );
+        return;
+      }
+      mcpServers[key] = server;
+    });
   }
   return mcpServers;
 }

@@ -6,7 +6,7 @@
 
 import {
   CoreToolScheduler,
-  GeminiClient,
+  type GeminiClient,
   GeminiEventType,
   ToolConfirmationOutcome,
   ApprovalMode,
@@ -14,17 +14,18 @@ import {
   MCPServerStatus,
   isNodeError,
   parseAndFormatApiError,
-} from '@google/gemini-cli-core';
-import type {
-  ToolConfirmationPayload,
-  CompletedToolCall,
-  ToolCall,
-  ToolCallRequestInfo,
-  ServerGeminiErrorEvent,
-  ServerGeminiStreamEvent,
-  ToolCallConfirmationDetails,
-  Config,
-  UserTierId,
+  safeLiteralReplace,
+  type AnyDeclarativeTool,
+  type ToolCall,
+  type ToolConfirmationPayload,
+  type CompletedToolCall,
+  type ToolCallRequestInfo,
+  type ServerGeminiErrorEvent,
+  type ServerGeminiStreamEvent,
+  type ToolCallConfirmationDetails,
+  type Config,
+  type UserTierId,
+  type AnsiOutput,
 } from '@google/gemini-cli-core';
 import type { RequestContext } from '@a2a-js/sdk/server';
 import { type ExecutionEventBus } from '@a2a-js/sdk/server';
@@ -51,6 +52,8 @@ import type {
   ThoughtSummary,
 } from '../types.js';
 import type { PartUnion, Part as genAiPart } from '@google/genai';
+
+type UnionKeys<T> = T extends T ? keyof T : never;
 
 export class Task {
   id: string;
@@ -82,18 +85,17 @@ export class Task {
     this.contextId = contextId;
     this.config = config;
     this.scheduler = this.createScheduler();
-    this.geminiClient = new GeminiClient(this.config);
+    this.geminiClient = this.config.getGeminiClient();
     this.pendingToolConfirmationDetails = new Map();
     this.taskState = 'submitted';
     this.eventBus = eventBus;
     this.completedToolCalls = [];
     this._resetToolCompletionPromise();
-    this.config.setFlashFallbackHandler(
-      async (currentModel: string, fallbackModel: string): Promise<boolean> => {
-        config.setModel(fallbackModel); // gemini-cli-core sets to DEFAULT_GEMINI_FLASH_MODEL
-        // Switch model for future use but return false to stop current retry
-        return false;
-      },
+    this.config.setFallbackModelHandler(
+      // For a2a-server, we want to automatically switch to the fallback model
+      // for future requests without retrying the current one. The 'stop'
+      // intent achieves this.
+      async () => 'stop',
     );
   }
 
@@ -133,7 +135,7 @@ export class Task {
       id: this.id,
       contextId: this.contextId,
       taskState: this.taskState,
-      model: this.config.getContentGeneratorConfig().model,
+      model: this.config.getModel(),
       mcpServers: servers,
       availableTools,
     };
@@ -227,7 +229,7 @@ export class Task {
     } = {
       coderAgent: coderAgentMessage,
       model: this.config.getModel(),
-      userTier: this.geminiClient.getUserTier(),
+      userTier: this.config.getUserTier(),
     };
 
     if (metadataError) {
@@ -285,20 +287,29 @@ export class Task {
 
   private _schedulerOutputUpdate(
     toolCallId: string,
-    outputChunk: string,
+    outputChunk: string | AnsiOutput,
   ): void {
+    let outputAsText: string;
+    if (typeof outputChunk === 'string') {
+      outputAsText = outputChunk;
+    } else {
+      outputAsText = outputChunk
+        .map((line) => line.map((token) => token.text).join(''))
+        .join('\n');
+    }
+
     logger.info(
       '[Task] Scheduler output update for tool call ' +
         toolCallId +
         ': ' +
-        outputChunk,
+        outputAsText,
     );
     const artifact: Artifact = {
       artifactId: `tool-${toolCallId}-output`,
       parts: [
         {
           kind: 'text',
-          text: outputChunk,
+          text: outputAsText,
         } as Part,
       ],
     };
@@ -426,6 +437,19 @@ export class Task {
     return scheduler;
   }
 
+  private _pickFields<
+    T extends ToolCall | AnyDeclarativeTool,
+    K extends UnionKeys<T>,
+  >(from: T, ...fields: K[]): Partial<T> {
+    const ret = {} as Pick<T, K>;
+    for (const field of fields) {
+      if (field in from) {
+        ret[field] = from[field];
+      }
+    }
+    return ret as Partial<T>;
+  }
+
   private toolStatusMessage(
     tc: ToolCall,
     taskId: string,
@@ -434,33 +458,33 @@ export class Task {
     const messageParts: Part[] = [];
 
     // Create a serializable version of the ToolCall (pick necesssary
-    // properties/avoic methods causing circular reference errors)
-    const serializableToolCall: { [key: string]: unknown } = {
-      request: tc.request,
-      status: tc.status,
-    };
-
-    // For WaitingToolCall type
-    if ('confirmationDetails' in tc) {
-      serializableToolCall['confirmationDetails'] = tc.confirmationDetails;
-    }
+    // properties/avoid methods causing circular reference errors)
+    const serializableToolCall: Partial<ToolCall> = this._pickFields(
+      tc,
+      'request',
+      'status',
+      'confirmationDetails',
+      'liveOutput',
+      'response',
+    );
 
     if (tc.tool) {
-      serializableToolCall['tool'] = {
-        name: tc.tool.name,
-        displayName: tc.tool.displayName,
-        description: tc.tool.description,
-        kind: tc.tool.kind,
-        isOutputMarkdown: tc.tool.isOutputMarkdown,
-        canUpdateOutput: tc.tool.canUpdateOutput,
-        schema: tc.tool.schema,
-        parameterSchema: tc.tool.parameterSchema,
-      };
+      serializableToolCall.tool = this._pickFields(
+        tc.tool,
+        'name',
+        'displayName',
+        'description',
+        'kind',
+        'isOutputMarkdown',
+        'canUpdateOutput',
+        'schema',
+        'parameterSchema',
+      ) as AnyDeclarativeTool;
     }
 
     messageParts.push({
       kind: 'data',
-      data: serializableToolCall as ToolCall,
+      data: serializableToolCall,
     } as Part);
 
     return {
@@ -509,8 +533,9 @@ export class Task {
     if (oldString === '' && !isNewFile) {
       return currentContent;
     }
-    // Use split/join to ensure replacement
-    return currentContent.split(oldString).join(newString);
+
+    // Use intelligent replacement that handles $ sequences safely
+    return safeLiteralReplace(currentContent, oldString, newString);
   }
 
   async scheduleToolCalls(
